@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Académie d'Échecs — Tableau de bord Prof</title>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600;700&family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+
+<!-- Firebase -->
+<script type="module">
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
+import { getDatabase, ref, set, onValue, push, remove, serverTimestamp, get }
+  from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js';
+
+const firebaseConfig = {
+  apiKey: "AIzaSyAJf6HTUY9A3rpp99Rb-wcT-lRFzZVmlQ8",
+  authDomain: "academie-des-echecs.firebaseapp.com",
+  databaseURL: "https://academie-des-echecs-default-rtdb.europe-west1.firebasedatabase.app",
+  projectId: "academie-des-echecs",
+  storageBucket: "academie-des-echecs.firebasestorage.app",
+  messagingSenderId: "845084420772",
+  appId: "1:845084420772:web:f04b2cf193794330f91431"
+};
+// ──────────────────────────────────────────────────────────────────────────
+
+const app = initializeApp(firebaseConfig);
+const db = getDatabase(app);
+
+// ─── ÉTAT ────────────────────────────────────────────────────────────────
+let board = Array(8).fill(null).map(() => Array(8).fill(null));
+let turn = 'w';
+let selected = null;
+let legalSquares = [];
+let lastMove = null;
+let flipped = false;
+let castling = { wK:true, wQ:true, bK:true, bQ:true };
+let enPassant = null;
+let correctMove = null;    // { from:[r,c], to:[r,c] } — le coup gagnant
+let sessionId = null;
+let responses = {};         // uid → { name, move, correct, ts }
+let sessionActive = false;
+
+// ─── CHESS ENGINE (identique à l'échiquier prof) ─────────────────────────
+const PIECES = { wK:'♔',wQ:'♕',wR:'♖',wB:'♗',wN:'♘',wP:'♙', bK:'♚',bQ:'♛',bR:'♜',bB:'♝',bN:'♞',bP:'♟' };
+const FILES = ['a','b','c','d','e','f','g','h'];
+
+function parseFen(fen) {
+  const parts = fen.trim().split(' ');
+  const rows = parts[0].split('/');
+  const b = Array(8).fill(null).map(() => Array(8).fill(null));
+  for (let r = 0; r < 8; r++) {
+    let c = 0;
+    for (const ch of rows[r]) {
+      if (/\d/.test(ch)) c += parseInt(ch);
+      else {
+        const color = ch === ch.toUpperCase() ? 'w' : 'b';
+        b[r][c] = color + ch.toUpperCase();
+        c++;
+      }
+    }
+  }
+  turn = parts[1] || 'w';
+  const cStr = parts[2] || '-';
+  castling = { wK:cStr.includes('K'), wQ:cStr.includes('Q'), bK:cStr.includes('k'), bQ:cStr.includes('q') };
+  enPassant = parts[3] !== '-' ? parts[3] : null;
+  return b;
+}
+
+function idxToCoord(r,c) { return FILES[c]+(8-r); }
+
+function isAttacked(b,r,c,byColor) {
+  for (const [dr,dc] of [[-2,-1],[-2,1],[-1,-2],[-1,2],[1,-2],[1,2],[2,-1],[2,1]]) {
+    const nr=r+dr,nc=c+dc;
+    if(nr>=0&&nr<8&&nc>=0&&nc<8&&b[nr][nc]===byColor+'N') return true;
+  }
+  for (const [dr,dc] of [[0,1],[0,-1],[1,0],[-1,0]]) {
+    let nr=r+dr,nc=c+dc;
+    while(nr>=0&&nr<8&&nc>=0&&nc<8){if(b[nr][nc]){if(b[nr][nc]===byColor+'R'||b[nr][nc]===byColor+'Q')return true;break;}nr+=dr;nc+=dc;}
+  }
+  for (const [dr,dc] of [[1,1],[1,-1],[-1,1],[-1,-1]]) {
+    let nr=r+dr,nc=c+dc;
+    while(nr>=0&&nr<8&&nc>=0&&nc<8){if(b[nr][nc]){if(b[nr][nc]===byColor+'B'||b[nr][nc]===byColor+'Q')return true;break;}nr+=dr;nc+=dc;}
+  }
+  for (const [dr,dc] of [[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]]) {
+    const nr=r+dr,nc=c+dc;
+    if(nr>=0&&nr<8&&nc>=0&&nc<8&&b[nr][nc]===byColor+'K') return true;
+  }
+  const pr=byColor==='w'?r+1:r-1;
+  if(pr>=0&&pr<8){if(c-1>=0&&b[pr][c-1]===byColor+'P')return true;if(c+1<8&&b[pr][c+1]===byColor+'P')return true;}
+  return false;
+}
+function findKing(b,color){for(let r=0;r<8;r++)for(let c=0;c<8;c++)if(b[r][c]===color+'K')return[r,c];return null;}
+function inCheck(b,color){const k=findKing(b,color);if(!k)return false;return isAttacked(b,k[0],k[1],color==='w'?'b':'w');}
+function pseudoLegal(b,r,c){
+  const piece=b[r][c];if(!piece)return[];
+  const[color,type]=[piece[0],piece[1]];
+  const moves=[];
+  const add=(nr,nc)=>{if(nr>=0&&nr<8&&nc>=0&&nc<8&&!(b[nr][nc]&&b[nr][nc][0]===color))moves.push([nr,nc]);};
+  const ray=(dr,dc)=>{let nr=r+dr,nc=c+dc;while(nr>=0&&nr<8&&nc>=0&&nc<8){if(b[nr][nc]&&b[nr][nc][0]===color)break;moves.push([nr,nc]);if(b[nr][nc])break;nr+=dr;nc+=dc;}};
+  if(type==='R')[[-1,0],[1,0],[0,-1],[0,1]].forEach(([dr,dc])=>ray(dr,dc));
+  else if(type==='B')[[-1,-1],[-1,1],[1,-1],[1,1]].forEach(([dr,dc])=>ray(dr,dc));
+  else if(type==='Q')[[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[-1,1],[1,-1],[1,1]].forEach(([dr,dc])=>ray(dr,dc));
+  else if(type==='N')[[-2,-1],[-2,1],[-1,-2],[-1,2],[1,-2],[1,2],[2,-1],[2,1]].forEach(([dr,dc])=>add(r+dr,c+dc));
+  else if(type==='K'){
+    [[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]].forEach(([dr,dc])=>add(r+dr,c+dc));
+    const enemy=color==='w'?'b':'w';
+    if(!inCheck(b,color)){
+      if(color==='w'&&r===7&&c===4){if(castling.wK&&!b[7][5]&&!b[7][6]&&!isAttacked(b,7,5,enemy)&&!isAttacked(b,7,6,enemy))moves.push([7,6]);if(castling.wQ&&!b[7][3]&&!b[7][2]&&!b[7][1]&&!isAttacked(b,7,3,enemy)&&!isAttacked(b,7,2,enemy))moves.push([7,2]);}
+      if(color==='b'&&r===0&&c===4){if(castling.bK&&!b[0][5]&&!b[0][6]&&!isAttacked(b,0,5,enemy)&&!isAttacked(b,0,6,enemy))moves.push([0,6]);if(castling.bQ&&!b[0][3]&&!b[0][2]&&!b[0][1]&&!isAttacked(b,0,3,enemy)&&!isAttacked(b,0,2,enemy))moves.push([0,2]);}
+    }
+  }
+  else if(type==='P'){
+    const dir=color==='w'?-1:1,start=color==='w'?6:1;
+    if(r+dir>=0&&r+dir<8&&!b[r+dir][c]){moves.push([r+dir,c]);if(r===start&&!b[r+2*dir][c])moves.push([r+2*dir,c]);}
+    [-1,1].forEach(dc=>{const nr=r+dir,nc=c+dc;if(nr>=0&&nr<8&&nc>=0&&nc<8&&(b[nr][nc]&&b[nr][nc][0]!==color||(enPassant&&idxToCoord(nr,nc)===enPassant)))moves.push([nr,nc]);});
+  }
+  return moves;
+}
+function getLegalMoves(b,r,c){
+  const piece=b[r][c];if(!piece)return[];
+  const color=piece[0];
+  return pseudoLegal(b,r,c).filter(([nr,nc])=>{
+    const nb=b.map(row=>[...row]);
+    if(piece[1]==='K'&&Math.abs(nc-c)===2){if(nc===6){nb[r][5]=nb[r][7];nb[r][7]=null;}if(nc===2){nb[r][3]=nb[r][0];nb[r][0]=null;}}
+    if(piece[1]==='P'&&nc!==c&&!nb[nr][nc])nb[r][nc]=null;
+    nb[nr][nc]=nb[r][c];nb[r][c]=null;
+    return !inCheck(nb,color);
+  });
+}
+
+// ─── FIREBASE OPS ─────────────────────────────────────────────────────────
+function genSessionId() {
+  return Math.random().toString(36).slice(2,8).toUpperCase();
+}
+
+window.launchSession = async function() {
+  if (!correctMove) { showToast('Définissez d\'abord le coup gagnant.', 'warn'); return; }
+  sessionId = genSessionId();
+  sessionActive = true;
+  responses = {};
+
+  const fenVal = document.getElementById('fen-input').value.trim() || 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+  const questionText = document.getElementById('question-text').value.trim() || 'Trouvez le meilleur coup !';
+
+  await set(ref(db, `sessions/${sessionId}`), {
+    fen: fenVal,
+    question: questionText,
+    correctMove: {
+      from: correctMove.from,
+      to: correctMove.to,
+      fromSq: idxToCoord(correctMove.from[0], correctMove.from[1]),
+      toSq: idxToCoord(correctMove.to[0], correctMove.to[1])
+    },
+    active: true,
+    launchedAt: serverTimestamp(),
+    group: document.getElementById('group-select').value
+  });
+
+  document.getElementById('session-code').textContent = sessionId;
+  document.getElementById('session-panel').style.display = 'block';
+  document.getElementById('launch-btn').style.display = 'none';
+  document.getElementById('stop-btn').style.display = 'block';
+
+  // Generate student link
+  const studentUrl = `${location.origin}${location.pathname.replace('prof.html','eleve.html')}?session=${sessionId}`;
+  document.getElementById('student-link').value = studentUrl;
+
+  // Listen for responses
+  onValue(ref(db, `sessions/${sessionId}/responses`), snap => {
+    responses = snap.val() || {};
+    renderResponses();
+  });
+
+  showToast(`Session ${sessionId} lancée !`, 'ok');
+};
+
+window.stopSession = async function() {
+  if (!sessionId) return;
+  await set(ref(db, `sessions/${sessionId}/active`), false);
+  sessionActive = false;
+  document.getElementById('launch-btn').style.display = 'block';
+  document.getElementById('stop-btn').style.display = 'none';
+  showToast('Session terminée.', 'ok');
+};
+
+window.copyLink = function() {
+  const link = document.getElementById('student-link').value;
+  navigator.clipboard.writeText(link).then(() => showToast('Lien copié !', 'ok'));
+};
+
+// ─── RENDER RESPONSES ─────────────────────────────────────────────────────
+function renderResponses() {
+  const list = Object.values(responses);
+  const total = list.length;
+  const correct = list.filter(r => r.correct).length;
+  const pct = total ? Math.round(correct/total*100) : 0;
+
+  document.getElementById('stat-total').textContent = total;
+  document.getElementById('stat-correct').textContent = correct;
+  document.getElementById('stat-wrong').textContent = total - correct;
+  document.getElementById('stat-pct').textContent = pct + '%';
+
+  // Progress bar
+  const bar = document.getElementById('progress-bar');
+  bar.style.width = pct + '%';
+  bar.style.background = pct >= 70 ? '#5BA85B' : pct >= 40 ? '#C9A050' : '#CC4444';
+
+  // Response table
+  const tbody = document.getElementById('resp-tbody');
+  tbody.innerHTML = '';
+  const sorted = list.sort((a,b) => (a.ts||0)-(b.ts||0));
+  sorted.forEach((r, i) => {
+    const tr = document.createElement('tr');
+    tr.className = r.correct ? 'row-ok' : 'row-ko';
+    const moveStr = r.move ? `${r.move.fromSq}→${r.move.toSq}` : '—';
+    tr.innerHTML = `
+      <td>${i+1}</td>
+      <td>${r.name || '?'}</td>
+      <td class="mono">${moveStr}</td>
+      <td>${r.correct ? '<span class="badge ok">✓ Correct</span>' : '<span class="badge ko">✗ Raté</span>'}</td>
+      <td>${r.ts ? new Date(r.ts).toLocaleTimeString('fr',{hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '—'}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  // Move distribution
+  const dist = {};
+  list.forEach(r => {
+    if (r.move) {
+      const k = `${r.move.fromSq}→${r.move.toSq}`;
+      dist[k] = (dist[k]||0) + 1;
+    }
+  });
+  const distEl = document.getElementById('move-dist');
+  distEl.innerHTML = Object.entries(dist).sort((a,b)=>b[1]-a[1]).map(([mv,cnt]) => {
+    const isCorrect = correctMove &&
+      idxToCoord(correctMove.from[0],correctMove.from[1]) === mv.split('→')[0] &&
+      idxToCoord(correctMove.to[0],correctMove.to[1]) === mv.split('→')[1];
+    return `<div class="dist-row">
+      <span class="dist-move mono ${isCorrect?'correct':''}">${mv}</span>
+      <div class="dist-bar-wrap"><div class="dist-bar ${isCorrect?'ok':'ko'}" style="width:${Math.round(cnt/total*100)}%"></div></div>
+      <span class="dist-cnt">${cnt}</span>
+    </div>`;
+  }).join('');
+}
+
+// ─── BOARD ────────────────────────────────────────────────────────────────
+const FENS = {
+  start: 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1',
+  mate1a: '6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1',
+  mate1b: '3k4/3Q4/3K4/8/8/8/8/8 w - - 0 1',
+  fork:   '4k3/8/8/3N4/8/8/8/3K4 w - - 0 1',
+};
+
+window.loadFen = function(key) {
+  const fen = key === 'custom' ? document.getElementById('fen-input').value.trim() : FENS[key];
+  if (!fen) return;
+  board = parseFen(fen);
+  if (key !== 'custom') document.getElementById('fen-input').value = fen;
+  selected = null; legalSquares = []; lastMove = null; correctMove = null;
+  updateCorrectMoveDisplay();
+  renderBoard();
+};
+
+function handleSquareClick(r, c) {
+  // Mode: définir le coup gagnant
+  if (selected) {
+    const isLegal = legalSquares.some(([lr,lc])=>lr===r&&lc===c);
+    if (isLegal) {
+      correctMove = { from: [...selected], to: [r,c] };
+      lastMove = { from: selected, to: [r,c] };
+      selected = null; legalSquares = [];
+      updateCorrectMoveDisplay();
+      renderBoard();
+      return;
+    }
+    if (board[r][c]?.[0] === turn) {
+      selected = [r,c]; legalSquares = getLegalMoves(board,r,c); renderBoard(); return;
+    }
+    selected = null; legalSquares = []; renderBoard(); return;
+  }
+  if (board[r][c]?.[0] === turn) {
+    selected = [r,c]; legalSquares = getLegalMoves(board,r,c); renderBoard();
+  }
+}
+
+function updateCorrectMoveDisplay() {
+  const el = document.getElementById('correct-move-display');
+  if (correctMove) {
+    const from = idxToCoord(correctMove.from[0], correctMove.from[1]);
+    const to   = idxToCoord(correctMove.to[0],   correctMove.to[1]);
+    el.textContent = `✓ Coup défini : ${from} → ${to}`;
+    el.className = 'correct-move-ok';
+  } else {
+    el.textContent = 'Cliquez une pièce puis sa destination pour définir le coup gagnant';
+    el.className = 'correct-move-empty';
+  }
+}
+
+function renderBoard() {
+  const el = document.getElementById('board');
+  el.innerHTML = '';
+  for (let ri = 0; ri < 8; ri++) {
+    for (let ci = 0; ci < 8; ci++) {
+      const r = flipped ? 7-ri : ri;
+      const c = flipped ? 7-ci : ci;
+      const sq = document.createElement('div');
+      sq.className = 'square ' + ((r+c)%2===0?'light':'dark');
+      // Last move highlight
+      if (lastMove) {
+        const [fr,fc]=lastMove.from,[tr2,tc]=lastMove.to;
+        if((r===fr&&c===fc)||(r===tr2&&c===tc)) sq.classList.add('last-move');
+      }
+      // Correct move highlight
+      if (correctMove) {
+        const [fr,fc]=correctMove.from,[tr2,tc]=correctMove.to;
+        if(r===fr&&c===fc) sq.classList.add('correct-from');
+        if(r===tr2&&c===tc) sq.classList.add('correct-to');
+      }
+      if (selected&&selected[0]===r&&selected[1]===c) sq.classList.add('selected');
+      if (selected&&legalSquares.some(([lr,lc])=>lr===r&&lc===c)) {
+        sq.classList.add(board[r][c]?'legal-capture':'legal-move');
+      }
+      if (board[r][c]) {
+        const p = document.createElement('span');
+        p.className = 'piece'; p.textContent = PIECES[board[r][c]];
+        sq.appendChild(p);
+      }
+      sq.addEventListener('click', ()=>handleSquareClick(r,c));
+      el.appendChild(sq);
+    }
+  }
+}
+
+// ─── UTILS ────────────────────────────────────────────────────────────────
+function showToast(msg, type='ok') {
+  const t = document.createElement('div');
+  t.className = `toast toast-${type}`;
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(()=>t.classList.add('show'),10);
+  setTimeout(()=>{t.classList.remove('show');setTimeout(()=>t.remove(),300);},2500);
+}
+
+window.flipBoard = ()=>{flipped=!flipped;selected=null;legalSquares=[];renderBoard();};
+window.clearMove = ()=>{correctMove=null;lastMove=null;selected=null;legalSquares=[];updateCorrectMoveDisplay();renderBoard();};
+
+// ─── INIT ─────────────────────────────────────────────────────────────────
+loadFen('start');
+updateCorrectMoveDisplay();
+
+</script>
+
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+:root{
+  --light:#F0D9B5;--dark:#B58863;--selected:#7FC97F;--last-move:rgba(252,217,50,0.45);
+  --correct-from:rgba(80,180,80,0.35);--correct-to:rgba(80,180,80,0.7);
+  --bg:#111;--panel:#1A1A1A;--border:#2A2A2A;--gold:#C9A050;
+  --text:#F0EAD6;--text-dim:#888;--green:#5BA85B;--red:#CC4444;--amber:#C9A050;
+}
+body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;flex-direction:column;}
+
+/* HEADER */
+.header{display:flex;align-items:center;gap:16px;padding:14px 24px;border-bottom:1px solid var(--border);}
+.logo{font-family:'Playfair Display',serif;font-size:18px;color:var(--gold);}
+.role-badge{background:rgba(201,160,80,0.15);border:1px solid rgba(201,160,80,0.3);color:var(--gold);font-size:11px;padding:3px 10px;border-radius:20px;letter-spacing:0.1em;text-transform:uppercase;}
+.header-right{margin-left:auto;display:flex;align-items:center;gap:10px;}
+
+/* GROUP SELECT */
+select{background:var(--panel);border:1px solid var(--border);color:var(--text);font-family:'DM Sans',sans-serif;font-size:12px;padding:6px 10px;border-radius:6px;cursor:pointer;}
+
+/* MAIN LAYOUT */
+.main{display:flex;flex:1;overflow:hidden;}
+.left-col{width:340px;min-width:300px;border-right:1px solid var(--border);display:flex;flex-direction:column;overflow-y:auto;}
+.right-col{flex:1;display:flex;flex-direction:column;overflow-y:auto;}
+
+/* SECTIONS */
+.section{padding:16px;border-bottom:1px solid var(--border);}
+.section-title{font-size:10px;font-weight:600;letter-spacing:0.12em;text-transform:uppercase;color:var(--text-dim);margin-bottom:12px;}
+
+/* BOARD */
+.board-wrap{padding:16px;display:flex;flex-direction:column;align-items:center;gap:10px;}
+#board{width:280px;height:280px;display:grid;grid-template-columns:repeat(8,1fr);grid-template-rows:repeat(8,1fr);border:2px solid var(--border);border-radius:2px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,0.5);}
+.square{display:flex;align-items:center;justify-content:center;cursor:pointer;position:relative;transition:filter 0.1s;}
+.square.light{background:var(--light);}
+.square.dark{background:var(--dark);}
+.square.selected{background:#7FC97F!important;}
+.square.last-move{background:var(--last-move)!important;}
+.square.correct-from{box-shadow:inset 0 0 0 3px rgba(80,200,80,0.8);}
+.square.correct-to{background:rgba(80,200,80,0.4)!important;}
+.square.legal-move::after{content:'';position:absolute;width:32%;height:32%;background:rgba(50,150,50,0.55);border-radius:50%;}
+.square.legal-capture::after{content:'';position:absolute;inset:0;border:3px solid rgba(50,150,50,0.6);}
+.square:hover{filter:brightness(1.1);}
+.piece{font-size:30px;user-select:none;text-shadow:0 1px 3px rgba(0,0,0,0.25);}
+
+/* CORRECT MOVE DISPLAY */
+.correct-move-ok{font-family:'DM Mono',monospace;font-size:12px;padding:8px 12px;border-radius:6px;background:rgba(91,168,91,0.15);border:1px solid rgba(91,168,91,0.4);color:#7FC97F;}
+.correct-move-empty{font-size:12px;padding:8px 12px;border-radius:6px;background:rgba(201,160,80,0.08);border:1px solid rgba(201,160,80,0.2);color:var(--text-dim);}
+
+/* INPUTS */
+.input{width:100%;background:rgba(255,255,255,0.05);border:1px solid var(--border);color:var(--text);font-family:'DM Sans',sans-serif;font-size:12px;padding:8px 12px;border-radius:6px;}
+.input:focus{outline:none;border-color:var(--gold);}
+textarea.input{resize:vertical;min-height:44px;line-height:1.4;}
+.label{font-size:11px;color:var(--text-dim);margin-bottom:5px;}
+
+/* BUTTONS */
+.btn{background:transparent;border:1px solid var(--border);color:var(--text);font-family:'DM Sans',sans-serif;font-size:12px;padding:8px 14px;border-radius:6px;cursor:pointer;transition:all 0.15s;white-space:nowrap;}
+.btn:hover{background:rgba(255,255,255,0.07);}
+.btn.gold{background:var(--gold);color:#111;border-color:var(--gold);font-weight:600;}
+.btn.gold:hover{background:#DDB860;}
+.btn.danger{border-color:var(--red);color:var(--red);}
+.btn.danger:hover{background:rgba(204,68,68,0.1);}
+.btn.sm{font-size:11px;padding:5px 10px;}
+.btn-row{display:flex;gap:6px;flex-wrap:wrap;}
+
+/* SESSION PANEL */
+#session-panel{display:none;}
+.session-code{font-family:'Playfair Display',serif;font-size:42px;font-weight:700;color:var(--gold);text-align:center;letter-spacing:0.08em;padding:12px 0;}
+.link-row{display:flex;gap:6px;align-items:center;}
+.link-input{flex:1;font-family:'DM Mono',monospace;font-size:11px;}
+
+/* STATS GRID */
+.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:16px;}
+.stat-card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:10px;text-align:center;}
+.stat-num{font-family:'Playfair Display',serif;font-size:26px;font-weight:700;}
+.stat-num.green{color:var(--green);}
+.stat-num.red{color:var(--red);}
+.stat-num.gold{color:var(--gold);}
+.stat-num.dim{color:var(--text-dim);}
+.stat-label{font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.08em;margin-top:2px;}
+
+/* PROGRESS BAR */
+.progress-wrap{background:var(--border);border-radius:20px;height:6px;margin-bottom:16px;overflow:hidden;}
+#progress-bar{height:100%;border-radius:20px;transition:width 0.4s,background 0.4s;width:0%;}
+
+/* RESPONSE TABLE */
+.resp-table{width:100%;border-collapse:collapse;font-size:12px;}
+.resp-table th{text-align:left;padding:6px 10px;color:var(--text-dim);font-size:10px;font-weight:500;letter-spacing:0.08em;text-transform:uppercase;border-bottom:1px solid var(--border);}
+.resp-table td{padding:7px 10px;border-bottom:1px solid rgba(255,255,255,0.04);vertical-align:middle;}
+.resp-table .row-ok td:first-child{border-left:2px solid var(--green);}
+.resp-table .row-ko td:first-child{border-left:2px solid var(--red);}
+.mono{font-family:'DM Mono',monospace;font-size:11px;}
+.badge{display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:500;padding:2px 8px;border-radius:20px;}
+.badge.ok{background:rgba(91,168,91,0.15);color:#7FC97F;}
+.badge.ko{background:rgba(204,68,68,0.12);color:#DD6666;}
+
+/* MOVE DISTRIBUTION */
+.dist-row{display:flex;align-items:center;gap:8px;margin-bottom:6px;}
+.dist-move{min-width:70px;font-size:12px;}
+.dist-move.correct{color:var(--green);font-weight:600;}
+.dist-bar-wrap{flex:1;background:var(--border);border-radius:4px;height:8px;overflow:hidden;}
+.dist-bar{height:100%;border-radius:4px;transition:width 0.4s;}
+.dist-bar.ok{background:var(--green);}
+.dist-bar.ko{background:var(--red);}
+.dist-cnt{min-width:20px;text-align:right;font-size:11px;color:var(--text-dim);}
+
+/* TOAST */
+.toast{position:fixed;bottom:24px;right:24px;background:var(--panel);border:1px solid var(--border);padding:10px 18px;border-radius:8px;font-size:13px;opacity:0;transform:translateY(8px);transition:all 0.25s;z-index:999;}
+.toast.show{opacity:1;transform:translateY(0);}
+.toast.toast-ok{border-color:rgba(91,168,91,0.5);color:#7FC97F;}
+.toast.toast-warn{border-color:rgba(201,160,80,0.5);color:var(--gold);}
+
+/* PRESET BUTTONS */
+.preset-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;}
+.preset-btn{background:rgba(255,255,255,0.04);border:1px solid var(--border);color:var(--text-dim);font-size:11px;padding:7px 10px;border-radius:6px;cursor:pointer;text-align:left;transition:all 0.15s;}
+.preset-btn:hover{background:rgba(201,160,80,0.1);border-color:var(--gold);color:var(--gold);}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="logo">♛ Académie d'Échecs</div>
+  <div class="role-badge">Professeur</div>
+  <div class="header-right">
+    <select id="group-select">
+      <option value="debutant">🟢 Débutant</option>
+      <option value="intermediaire">🔵 Intermédiaire</option>
+      <option value="avance">🟠 Avancé</option>
+      <option value="expert">🔴 Expert</option>
+    </select>
+  </div>
+</div>
+
+<div class="main">
+
+  <!-- COLONNE GAUCHE — Échiquier + config -->
+  <div class="left-col">
+
+    <div class="board-wrap">
+      <div id="board"></div>
+      <div class="btn-row">
+        <button class="btn sm" onclick="flipBoard()">⟳ Retourner</button>
+        <button class="btn sm" onclick="clearMove()">✕ Effacer coup</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Coup gagnant</div>
+      <div id="correct-move-display" class="correct-move-empty">—</div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Positions types</div>
+      <div class="preset-grid">
+        <button class="preset-btn" onclick="loadFen('start')">♟ Départ</button>
+        <button class="preset-btn" onclick="loadFen('mate1a')">⚡ Mat en 1 (A)</button>
+        <button class="preset-btn" onclick="loadFen('mate1b')">⚡ Mat en 1 (B)</button>
+        <button class="preset-btn" onclick="loadFen('fork')">🍴 Fourchette</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">FEN personnalisée</div>
+      <div class="label">Coller une FEN :</div>
+      <textarea class="input" id="fen-input" placeholder="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"></textarea>
+      <button class="btn sm" style="margin-top:6px" onclick="loadFen('custom')">Charger</button>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Question pour les élèves</div>
+      <input class="input" id="question-text" type="text" placeholder="Ex : Trouvez le mat en 1 coup. Les Blancs jouent." value="Trouvez le meilleur coup ! Les Blancs jouent.">
+    </div>
+
+  </div>
+
+  <!-- COLONNE DROITE — Lancement + Stats -->
+  <div class="right-col">
+
+    <!-- LANCEMENT -->
+    <div class="section">
+      <div class="section-title">Session</div>
+      <div style="display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap;">
+        <button id="launch-btn" class="btn gold" onclick="launchSession()">▶ Lancer la session</button>
+        <button id="stop-btn" class="btn danger" onclick="stopSession()" style="display:none;">⏹ Terminer</button>
+      </div>
+
+      <div id="session-panel">
+        <div class="session-code" id="session-code">——</div>
+        <p style="text-align:center;font-size:12px;color:var(--text-dim);margin-bottom:12px;">Code à donner aux élèves — ou partager le lien :</p>
+        <div class="link-row">
+          <input class="input link-input" id="student-link" readonly>
+          <button class="btn sm gold" onclick="copyLink()">Copier</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- STATS EN TEMPS RÉEL -->
+    <div class="section">
+      <div class="section-title">Résultats en temps réel</div>
+
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-num dim" id="stat-total">0</div>
+          <div class="stat-label">Réponses</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-num green" id="stat-correct">0</div>
+          <div class="stat-label">Correct</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-num red" id="stat-wrong">0</div>
+          <div class="stat-label">Raté</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-num gold" id="stat-pct">0%</div>
+          <div class="stat-label">Réussite</div>
+        </div>
+      </div>
+
+      <div class="progress-wrap"><div id="progress-bar"></div></div>
+
+      <div style="margin-bottom:12px;">
+        <div class="label" style="margin-bottom:8px;">Distribution des coups joués</div>
+        <div id="move-dist" style="font-size:12px;color:var(--text-dim);">En attente de réponses…</div>
+      </div>
+    </div>
+
+    <!-- TABLEAU DES ÉLÈVES -->
+    <div class="section">
+      <div class="section-title">Réponses élève par élève</div>
+      <div style="overflow-x:auto;">
+        <table class="resp-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Élève</th>
+              <th>Coup joué</th>
+              <th>Résultat</th>
+              <th>Heure</th>
+            </tr>
+          </thead>
+          <tbody id="resp-tbody">
+            <tr><td colspan="5" style="color:var(--text-dim);text-align:center;padding:20px;">En attente de réponses…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+</body>
+</html>
